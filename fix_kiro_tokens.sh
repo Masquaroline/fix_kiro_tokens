@@ -405,13 +405,13 @@ main() {
 
     # 使用 find 命令搜索
     while IFS= read -r -d '' file; do
-        ((files_found++))
+        files_found=$((files_found + 1))
         log_info "找到文件 #$files_found: $file"
 
         if process_file "$file"; then
-            ((files_processed++))
+            files_processed=$((files_processed + 1))
         else
-            ((files_failed++))
+            files_failed=$((files_failed + 1))
         fi
 
         echo "----------------------------------------"

@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# 脚本：修复所有 claude-kiro.js 文件中的 outtokens 计算逻辑
-# 功能：优先使用 Claude 官方 tokenizer，失败则回退到 contextUsagePercentage
+# 脚本：为所有 claude-kiro.js 文件添加详细的 token 计算日志
+# 功能：在 estimateInputTokens 方法中添加调试日志，不改变原有计算逻辑
 # 作者：自动生成
 # 日期：2026-01-11
 
@@ -45,20 +45,19 @@ validate_file() {
 
     # 检查文件是否包含关键标识
     if grep -q "class KiroApiService" "$file" && \
-       grep -q "buildClaudeResponse" "$file" && \
-       grep -q "generateContentStream" "$file" && \
-       grep -q "countTokens" "$file"; then
+       grep -q "estimateInputTokens" "$file" && \
+       grep -q "countTextTokens" "$file"; then
         return 0
     else
         return 1
     fi
 }
 
-# 主修复函数：修改流式和非流式的 token 计算逻辑
-fix_token_calculation() {
+# 主修复函数：添加详细的 token 计算日志
+add_token_debug_logs() {
     local file=$1
 
-    log_info "修复 token 计算逻辑（优先 tokenizer，回退 contextUsagePercentage）: $file"
+    log_info "添加 token 计算调试日志: $file"
 
     # 创建临时 Python 脚本进行精确修改
     python3 - "$file" <<'PYTHON_SCRIPT'
@@ -73,258 +72,100 @@ with open(file_path, 'r', encoding='utf-8') as f:
 modifications_made = []
 
 # ============================================================
-# 修改 1: 流式响应 - generateContentStream 方法
+# 修改：在 estimateInputTokens 方法中添加详细日志
 # ============================================================
-old_streaming_pattern = r'''            // 6\. 发送 message_delta 事件
-            // 如果有 contextUsagePercentage，使用它来计算 token
-            // 总上下文 200k tokens，通过百分比计算总使用量，再减去输入 token 得到输出 token
-            let totalTokens = 0;
-            if \(contextUsagePercentage !== null && contextUsagePercentage > 0\) \{
-                const totalContextTokens = KIRO_CONSTANTS\.TOTAL_CONTEXT_TOKENS;
-                // totalUsedTokens 就是通过百分比计算出的总使用量，直接作为 total_tokens
-                totalTokens = Math\.round\(totalContextTokens \* contextUsagePercentage / 100\);
-                outputTokens = Math\.max\(0, totalTokens - inputTokens\);
-                console\.log\(`\[Kiro\] Token calculation from contextUsagePercentage: total=\$\{totalTokens\}, input=\$\{inputTokens\}, output=\$\{outputTokens\}`\);
-            \} else \{
-                // 回退到原来的计算方式
-                outputTokens = this\.countTextTokens\(totalContent\);
-                for \(const tc of toolCalls\) \{
-                    outputTokens \+= this\.countTextTokens\(JSON\.stringify\(tc\.input \|\| \{\}\)\);
+
+# 查找原始的 estimateInputTokens 方法
+old_pattern = r'''    estimateInputTokens\(requestBody\) \{
+        let totalTokens = 0;
+
+        // Count system prompt tokens
+        if \(requestBody\.system\) \{
+            const systemText = this\.getContentText\(requestBody\.system\);
+            totalTokens \+= this\.countTextTokens\(systemText\);
+        \}
+
+        // Count all messages tokens
+        if \(requestBody\.messages && Array\.isArray\(requestBody\.messages\)\) \{
+            for \(const message of requestBody\.messages\) \{
+                if \(message\.content\) \{
+                    const contentText = this\.getContentText\(message\);
+                    totalTokens \+= this\.countTextTokens\(contentText\);
                 \}
-                totalTokens = inputTokens \+ outputTokens;
-            \}'''
+            \}
+        \}
 
-new_streaming_pattern = '''            // 6. 发送 message_delta 事件
-            // 三层优先级策略：
-            // 1. 优先使用 Claude 官方 tokenizer (@anthropic-ai/tokenizer) 精确计算
-            // 2. 如果 tokenizer 失败，使用 contextUsagePercentage 计算
-            // 3. 如果都没有，使用文本长度估算
-            let totalTokens = 0;
-            let calculationMethod = 'unknown';
+        // Count tools definitions tokens if present
+        if \(requestBody\.tools && Array\.isArray\(requestBody\.tools\)\) \{
+            totalTokens \+= this\.countTextTokens\(JSON\.stringify\(requestBody\.tools\)\);
+        \}
 
-            try {
-                // 优先：使用 Claude 官方 tokenizer 精确计算
-                outputTokens = this.countTextTokens(totalContent);
-                for (const tc of toolCalls) {
-                    outputTokens += this.countTextTokens(JSON.stringify(tc.input || {}));
+        return totalTokens;
+    \}'''
+
+# 新的带详细日志的版本
+new_pattern = '''    estimateInputTokens(requestBody) {
+        let totalTokens = 0;
+
+        // 用于收集各部分的 token 统计
+        const tokenBreakdown = {
+            system: 0,
+            messages: 0,
+            messagesCount: 0,
+            tools: 0,
+            total: 0
+        };
+
+        // Count system prompt tokens
+        if (requestBody.system) {
+            const systemText = this.getContentText(requestBody.system);
+            const systemTokens = this.countTextTokens(systemText);
+            tokenBreakdown.system = systemTokens;
+            totalTokens += systemTokens;
+        }
+
+        // Count all messages tokens
+        if (requestBody.messages && Array.isArray(requestBody.messages)) {
+            tokenBreakdown.messagesCount = requestBody.messages.length;
+            let messagesTotal = 0;
+            for (const message of requestBody.messages) {
+                if (message.content) {
+                    const contentText = this.getContentText(message);
+                    const msgTokens = this.countTextTokens(contentText);
+                    messagesTotal += msgTokens;
                 }
-                totalTokens = inputTokens + outputTokens;
-                calculationMethod = 'tokenizer';
-                console.log(`[Kiro] Token calculation (PRECISE - Claude Official Tokenizer): total=${totalTokens}, input=${inputTokens}, output=${outputTokens}`);
-            } catch (tokenizerError) {
-                // 回退1：使用 contextUsagePercentage 计算
-                console.warn(`[Kiro] Tokenizer failed: ${tokenizerError.message}, falling back to contextUsagePercentage`);
+            }
+            tokenBreakdown.messages = messagesTotal;
+            totalTokens += messagesTotal;
+        }
 
-                if (contextUsagePercentage !== null && contextUsagePercentage > 0) {
-                    const totalContextTokens = KIRO_CONSTANTS.TOTAL_CONTEXT_TOKENS;
-                    totalTokens = Math.round(totalContextTokens * contextUsagePercentage / 100);
-                    outputTokens = Math.max(0, totalTokens - inputTokens);
-                    calculationMethod = 'contextUsagePercentage';
-                    console.log(`[Kiro] Token calculation (FALLBACK - contextUsagePercentage): total=${totalTokens}, input=${inputTokens}, output=${outputTokens}, percentage=${contextUsagePercentage}%`);
-                } else {
-                    // 回退2：使用文本长度估算（最后兜底）
-                    outputTokens = Math.ceil((totalContent || '').length / 4);
-                    for (const tc of toolCalls) {
-                        outputTokens += Math.ceil(JSON.stringify(tc.input || {}).length / 4);
-                    }
-                    totalTokens = inputTokens + outputTokens;
-                    calculationMethod = 'estimation';
-                    console.warn(`[Kiro] Token calculation (ESTIMATION - text length / 4): total=${totalTokens}, input=${inputTokens}, output=${outputTokens}`);
-                }
-            }'''
+        // Count tools definitions tokens if present
+        if (requestBody.tools && Array.isArray(requestBody.tools)) {
+            const toolsTokens = this.countTextTokens(JSON.stringify(requestBody.tools));
+            tokenBreakdown.tools = toolsTokens;
+            totalTokens += toolsTokens;
+        }
 
-if re.search(old_streaming_pattern, content, flags=re.MULTILINE | re.DOTALL):
-    content = re.sub(old_streaming_pattern, new_streaming_pattern, content, flags=re.MULTILINE | re.DOTALL)
-    modifications_made.append("✓ 流式响应 (generateContentStream)")
+        tokenBreakdown.total = totalTokens;
+
+        // 输出详细的 token 统计日志
+        console.log('[Kiro Token Debug] ========================================');
+        console.log('[Kiro Token Debug] Input Tokens Breakdown:');
+        console.log(`[Kiro Token Debug]   - System Prompt: ${tokenBreakdown.system} tokens`);
+        console.log(`[Kiro Token Debug]   - Messages (${tokenBreakdown.messagesCount} msgs): ${tokenBreakdown.messages} tokens`);
+        console.log(`[Kiro Token Debug]   - Tools Definition: ${tokenBreakdown.tools} tokens`);
+        console.log(`[Kiro Token Debug]   - TOTAL INPUT: ${tokenBreakdown.total} tokens`);
+        console.log('[Kiro Token Debug] ========================================');
+
+        return totalTokens;
+    }'''
+
+# 执行替换
+if re.search(old_pattern, content, flags=re.MULTILINE | re.DOTALL):
+    content = re.sub(old_pattern, new_pattern, content, flags=re.MULTILINE | re.DOTALL)
+    modifications_made.append("✓ 已添加 estimateInputTokens 详细日志")
 else:
-    print("⚠ 未找到流式响应的匹配代码块")
-
-# ============================================================
-# 修改 2: 非流式响应 - buildClaudeResponse 方法（流式模式）
-# ============================================================
-old_buildresponse_streaming = r'''            if \(toolCalls && toolCalls\.length > 0\) \{
-                toolCalls\.forEach\(\(tc, index\) => \{
-                    let inputObject;
-                    try \{
-                        // Arguments should be a stringified JSON object, need to parse it
-                        const args = tc\.function\.arguments;
-                        inputObject = typeof args === 'string' \? JSON\.parse\(args\) : args;
-                    \} catch \(e\) \{
-                        console\.warn\(`\[Kiro\] Invalid JSON for tool call arguments\. Wrapping in raw_arguments\. Error: \$\{e\.message\}`\, tc\.function\.arguments\);
-                        // If parsing fails, wrap the raw string in an object as a fallback,
-                        // since Claude's `input` field expects an object\.
-                        inputObject = \{ "raw_arguments": tc\.function\.arguments \};
-                    \}
-                    // 2\. content_block_start for each tool_use
-                    events\.push\(\{
-                        type: "content_block_start",
-                        index: index,
-                        content_block: \{
-                            type: "tool_use",
-                            id: tc\.id,
-                            name: tc\.function\.name,
-                            input: \{\} // input is streamed via input_json_delta
-                        \}
-                    \}\);
-
-                    // 3\. content_block_delta for each tool_use
-                    // Since Kiro is not truly streaming, we send the full arguments as one delta\.
-                    events\.push\(\{
-                        type: "content_block_delta",
-                        index: index,
-                        delta: \{
-                            type: "input_json_delta",
-                            partial_json: JSON\.stringify\(inputObject\)
-                        \}
-                    \}\);
-
-                    // 4\. content_block_stop for each tool_use
-                    events\.push\(\{
-                        type: "content_block_stop",
-                        index: index
-                    \}\);
-                    totalOutputTokens \+= this\.countTextTokens\(JSON\.stringify\(inputObject\)\);
-                \}\);
-                stopReason = "tool_use"; // If there are tool calls, the stop reason is tool_use
-            \}'''
-
-new_buildresponse_streaming = '''            if (toolCalls && toolCalls.length > 0) {
-                toolCalls.forEach((tc, index) => {
-                    let inputObject;
-                    try {
-                        // Arguments should be a stringified JSON object, need to parse it
-                        const args = tc.function.arguments;
-                        inputObject = typeof args === 'string' ? JSON.parse(args) : args;
-                    } catch (e) {
-                        console.warn(`[Kiro] Invalid JSON for tool call arguments. Wrapping in raw_arguments. Error: ${e.message}`, tc.function.arguments);
-                        // If parsing fails, wrap the raw string in an object as a fallback,
-                        // since Claude's `input` field expects an object.
-                        inputObject = { "raw_arguments": tc.function.arguments };
-                    }
-                    // 2. content_block_start for each tool_use
-                    events.push({
-                        type: "content_block_start",
-                        index: index,
-                        content_block: {
-                            type: "tool_use",
-                            id: tc.id,
-                            name: tc.function.name,
-                            input: {} // input is streamed via input_json_delta
-                        }
-                    });
-
-                    // 3. content_block_delta for each tool_use
-                    // Since Kiro is not truly streaming, we send the full arguments as one delta.
-                    events.push({
-                        type: "content_block_delta",
-                        index: index,
-                        delta: {
-                            type: "input_json_delta",
-                            partial_json: JSON.stringify(inputObject)
-                        }
-                    });
-
-                    // 4. content_block_stop for each tool_use
-                    events.push({
-                        type: "content_block_stop",
-                        index: index
-                    });
-                    // 优先使用 Claude 官方 tokenizer，失败则使用文本长度估算
-                    try {
-                        totalOutputTokens += this.countTextTokens(JSON.stringify(inputObject));
-                    } catch (e) {
-                        totalOutputTokens += Math.ceil(JSON.stringify(inputObject).length / 4);
-                    }
-                });
-                stopReason = "tool_use"; // If there are tool calls, the stop reason is tool_use
-            }'''
-
-if re.search(old_buildresponse_streaming, content, flags=re.MULTILINE | re.DOTALL):
-    content = re.sub(old_buildresponse_streaming, new_buildresponse_streaming, content, flags=re.MULTILINE | re.DOTALL)
-    modifications_made.append("✓ 非流式响应 - buildClaudeResponse (流式模式)")
-else:
-    print("⚠ 未找到 buildClaudeResponse 流式模式的匹配代码块")
-
-# ============================================================
-# 修改 3: 非流式响应 - buildClaudeResponse 方法（非流式模式）
-# ============================================================
-old_buildresponse_nonstreaming = r'''            if \(toolCalls && toolCalls\.length > 0\) \{
-                for \(const tc of toolCalls\) \{
-                    let inputObject;
-                    try \{
-                        // Arguments should be a stringified JSON object, need to parse it
-                        const args = tc\.function\.arguments;
-                        inputObject = typeof args === 'string' \? JSON\.parse\(args\) : args;
-                    \} catch \(e\) \{
-                        console\.warn\(`\[Kiro\] Invalid JSON for tool call arguments\. Wrapping in raw_arguments\. Error: \$\{e\.message\}`\, tc\.function\.arguments\);
-                        // If parsing fails, wrap the raw string in an object as a fallback,
-                        // since Claude's `input` field expects an object\.
-                        inputObject = \{ "raw_arguments": tc\.function\.arguments \};
-                    \}
-                    contentArray\.push\(\{
-                        type: "tool_use",
-                        id: tc\.id,
-                        name: tc\.function\.name,
-                        input: inputObject
-                    \}\);
-                    outputTokens \+= this\.countTextTokens\(tc\.function\.arguments\);
-                \}
-                stopReason = "tool_use"; // Set stop_reason to "tool_use" when toolCalls exist
-            \} else if \(content\) \{
-                contentArray\.push\(\{
-                    type: "text",
-                    text: content
-                \}\);
-                outputTokens \+= this\.countTextTokens\(content\);
-            \}'''
-
-new_buildresponse_nonstreaming = '''            if (toolCalls && toolCalls.length > 0) {
-                for (const tc of toolCalls) {
-                    let inputObject;
-                    try {
-                        // Arguments should be a stringified JSON object, need to parse it
-                        const args = tc.function.arguments;
-                        inputObject = typeof args === 'string' ? JSON.parse(args) : args;
-                    } catch (e) {
-                        console.warn(`[Kiro] Invalid JSON for tool call arguments. Wrapping in raw_arguments. Error: ${e.message}`, tc.function.arguments);
-                        // If parsing fails, wrap the raw string in an object as a fallback,
-                        // since Claude's `input` field expects an object.
-                        inputObject = { "raw_arguments": tc.function.arguments };
-                    }
-                    contentArray.push({
-                        type: "tool_use",
-                        id: tc.id,
-                        name: tc.function.name,
-                        input: inputObject
-                    });
-                    // 优先使用 Claude 官方 tokenizer (@anthropic-ai/tokenizer)，失败则使用文本长度估算
-                    try {
-                        outputTokens += this.countTextTokens(JSON.stringify(inputObject));
-                    } catch (e) {
-                        console.warn(`[Kiro] Tokenizer failed for tool call, using estimation: ${e.message}`);
-                        outputTokens += Math.ceil(JSON.stringify(inputObject).length / 4);
-                    }
-                }
-                stopReason = "tool_use"; // Set stop_reason to "tool_use" when toolCalls exist
-            } else if (content) {
-                contentArray.push({
-                    type: "text",
-                    text: content
-                });
-                // 优先使用 Claude 官方 tokenizer (@anthropic-ai/tokenizer)，失败则使用文本长度估算
-                try {
-                    outputTokens += this.countTextTokens(content);
-                } catch (e) {
-                    console.warn(`[Kiro] Tokenizer failed for content, using estimation: ${e.message}`);
-                    outputTokens += Math.ceil((content || '').length / 4);
-                }
-            }'''
-
-if re.search(old_buildresponse_nonstreaming, content, flags=re.MULTILINE | re.DOTALL):
-    content = re.sub(old_buildresponse_nonstreaming, new_buildresponse_nonstreaming, content, flags=re.MULTILINE | re.DOTALL)
-    modifications_made.append("✓ 非流式响应 - buildClaudeResponse (非流式模式)")
-else:
-    print("⚠ 未找到 buildClaudeResponse 非流式模式的匹配代码块")
+    print("⚠ 未找到标准的 estimateInputTokens 方法，可能文件已被修改或版本不同")
 
 # 写入修改后的内容
 with open(file_path, 'w', encoding='utf-8') as f:
@@ -356,8 +197,8 @@ process_file() {
     # 备份文件
     backup_file "$file"
 
-    # 执行修复
-    fix_token_calculation "$file"
+    # 执行修改
+    add_token_debug_logs "$file"
 
     log_success "文件处理完成: $file"
     return 0
@@ -451,18 +292,27 @@ show_help() {
 
 说明:
     此脚本会自动搜索系统中的所有 claude-kiro.js 文件，
-    并将 outtokens 的计算逻辑修改为三层优先级策略。
+    并在 estimateInputTokens 方法中添加详细的 token 计算日志。
 
-    三层优先级策略：
-    1. 优先：使用 Claude 官方 tokenizer (@anthropic-ai/tokenizer) 精确计算
-    2. 回退1：如果 tokenizer 失败，使用 contextUsagePercentage 计算
-    3. 回退2：如果都没有，使用文本长度估算（length / 4）
+    添加的日志内容：
+    - System Prompt 的 token 数
+    - 所有消息的 token 数（包括消息数量）
+    - Tools 定义的 token 数
+    - 总输入 token 数
 
-    修改位置：
-    - 流式响应 (generateContentStream): 完整的三层策略
-    - 非流式响应 (buildClaudeResponse): tokenizer + 文本估算
+    日志格式示例：
+    [Kiro Token Debug] ========================================
+    [Kiro Token Debug] Input Tokens Breakdown:
+    [Kiro Token Debug]   - System Prompt: 5234 tokens
+    [Kiro Token Debug]   - Messages (15 msgs): 20145 tokens
+    [Kiro Token Debug]   - Tools Definition: 2004 tokens
+    [Kiro Token Debug]   - TOTAL INPUT: 27383 tokens
+    [Kiro Token Debug] ========================================
 
-    所有修改前的文件都会自动备份（.backup.时间戳）。
+    注意：
+    - 原有的计算逻辑完全不变
+    - 只是添加了详细的日志输出
+    - 所有修改前的文件都会自动备份（.backup.时间戳）
 
 EOF
 }
